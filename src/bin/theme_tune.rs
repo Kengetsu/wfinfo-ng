@@ -7,10 +7,9 @@ use std::{
 };
 
 use eframe::{
-    egui::{self, Key},
+    egui::{self, Key, TextureHandle, TextureOptions},
     epaint::ColorImage,
 };
-use egui_extras::RetainedImage;
 use image::{io::Reader, DynamicImage, Rgb};
 use palette::{FromColor, Hsl, Srgb};
 use wfinfo::{
@@ -24,14 +23,15 @@ fn main() {
     eframe::run_native(
         "Tune theme detection",
         options,
-        Box::new(|_cc| Box::<MyApp>::default()),
-    );
+        Box::new(|_cc| Ok(Box::<MyApp>::default())),
+    )
+    .unwrap();
 }
 
 struct MyApp {
     original_images: Vec<DynamicImage>,
     selected_image_index: usize,
-    image: Option<RetainedImage>,
+    texture: Option<TextureHandle>,
 
     ocr_request_sender: Sender<(usize, HslRange<f32>)>,
     ocr_response_receiver: Receiver<Vec<(String, String)>>,
@@ -55,7 +55,7 @@ impl Default for MyApp {
         Self {
             original_images,
             selected_image_index: 0,
-            image: None,
+            texture: None,
 
             ocr_request_sender,
             ocr_response_receiver,
@@ -115,27 +115,27 @@ fn spawn_ocr_thread(
 impl eframe::App for MyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.request_repaint();
-        if ctx.input_mut().consume_key(egui::Modifiers::NONE, Key::N) {
+        if ctx.input(|i| i.key_pressed(Key::N)) {
             self.selected_image_index =
                 (self.selected_image_index + 1) % self.original_images.len();
-            self.image = None;
+            self.texture = None;
             self.ocr_request_sender
                 .send((self.selected_image_index, self.settings.clone()))
                 .unwrap();
             self.ocr_result = None;
         }
-        if ctx.input_mut().consume_key(egui::Modifiers::NONE, Key::P) {
+        if ctx.input(|i| i.key_pressed(Key::P)) {
             self.selected_image_index =
                 (self.selected_image_index - 1) % self.original_images.len();
-            self.image = None;
+            self.texture = None;
             self.ocr_request_sender
                 .send((self.selected_image_index, self.settings.clone()))
                 .unwrap();
             self.ocr_result = None;
         }
-        if self.image.is_none() {
+        if self.texture.is_none() {
             let image = self.process_image(&self.original_images[self.selected_image_index]);
-            self.image = Some(convert_image(&image));
+            self.texture = Some(convert_image(ctx, &image));
             self.ocr_request_sender
                 .send((self.selected_image_index, self.settings.clone()))
                 .unwrap();
@@ -149,9 +149,13 @@ impl eframe::App for MyApp {
             }
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| match self.image.as_ref() {
-            Some(image) => {
-                image.show_scaled(ui, 3.0);
+        egui::CentralPanel::default().show(ctx, |ui| match self.texture.as_ref() {
+            Some(texture) => {
+                let size = egui::vec2(
+                    texture.size()[0] as f32 * 3.0,
+                    texture.size()[1] as f32 * 3.0,
+                );
+                ui.image((texture.id(), size));
                 if let Some(detections) = self.ocr_result.as_ref() {
                     ui.label(format!("{:#?}", detections));
                 } else {
@@ -200,7 +204,7 @@ impl eframe::App for MyApp {
                     )
                     .changed()
             {
-                self.image = None;
+                self.texture = None;
                 self.ocr_request_sender
                     .send((self.selected_image_index, self.settings.clone()))
                     .unwrap();
@@ -227,8 +231,6 @@ impl MyApp {
         let height = image.height() as f32;
         let most_width = PIXEL_REWARD_WIDTH * screen_scaling;
         let most_left = width / 2.0 - most_width / 2.0;
-        // Most Top = pixleRewardYDisplay - pixleRewardHeight + pixelRewardLineHeight
-        //                   (316          -        235        +       44)    *    1.1    =    137
         let most_top = height / 2.0
             - ((PIXEL_REWARD_YDISPLAY - PIXEL_REWARD_HEIGHT + PIXEL_REWARD_LINE_HEIGHT)
                 * screen_scaling);
@@ -263,11 +265,11 @@ impl MyApp {
     }
 }
 
-fn convert_image(original_image: &DynamicImage) -> RetainedImage {
+fn convert_image(ctx: &egui::Context, original_image: &DynamicImage) -> TextureHandle {
+    let rgba = original_image.to_rgba8();
     let ui_image = ColorImage::from_rgba_unmultiplied(
         [original_image.width() as _, original_image.height() as _],
-        &original_image.to_rgba8(),
+        &rgba,
     );
-    RetainedImage::from_color_image("Temp", ui_image)
-        .with_texture_filter(egui::TextureFilter::Nearest)
+    ctx.load_texture("theme-tune-image", ui_image, TextureOptions::NEAREST)
 }

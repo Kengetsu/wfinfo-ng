@@ -14,8 +14,9 @@ fn main() {
     eframe::run_native(
         "Warframe Ability Timer",
         options,
-        Box::new(|_cc| Box::<MyApp>::new(MyApp::new(arguments))),
-    );
+        Box::new(|_cc| Ok(Box::new(MyApp::new(arguments)))),
+    )
+    .unwrap();
 }
 
 #[derive(Parser, Debug)]
@@ -88,7 +89,7 @@ impl eframe::App for MyApp {
             Color32::GREEN
         };
 
-        let frame = Frame::default().fill(color).inner_margin(4.0);
+        let frame = Frame::default().fill(color).inner_margin(eframe::egui::Margin::same(4));
         CentralPanel::default().frame(frame).show(ctx, |_ui| {});
     }
 }

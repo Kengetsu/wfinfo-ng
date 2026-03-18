@@ -1,3 +1,5 @@
+// Overlay moved to library
+
 use std::thread::sleep;
 use std::time::Duration;
 use std::{error::Error, str::FromStr};
@@ -9,6 +11,7 @@ use std::{
 use std::{path::PathBuf, sync::mpsc};
 
 use clap::Parser;
+use eframe::egui;
 use env_logger::{Builder, Env};
 use global_hotkey::{hotkey::HotKey, GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use image::DynamicImage;
@@ -22,16 +25,23 @@ use wfinfo::{
     utils::fetch_prices_and_items,
 };
 
-fn run_detection(capturer: &Window, db: &Database) {
+use wfinfo::overlay::{DetectedItem, DetectionResult, OverlayApp};
+
+// ── Detection ─────────────────────────────────────────────────────────────────
+
+fn run_detection(capturer: &Window, db: &Database) -> DetectionResult {
     let frame = capturer.capture_image().unwrap();
     info!("Captured");
     let image = DynamicImage::ImageRgba8(frame);
     info!("Converted");
     let text = reward_image_to_reward_names(image, None);
-    let text = text.iter().map(|s| normalize_string(s));
-    debug!("{:#?}", text);
+    let text_normalized: Vec<String> = text.iter().map(|s| normalize_string(s)).collect();
+    debug!("{:#?}", text_normalized);
 
-    let items: Vec<_> = text.map(|s| db.find_item(&s, None)).collect();
+    let items: Vec<Option<_>> = text_normalized
+        .iter()
+        .map(|s| db.find_item(s, None))
+        .collect();
 
     let best = items
         .iter()
@@ -46,20 +56,34 @@ fn run_detection(capturer: &Window, db: &Database) {
         .max_by(|a, b| a.1.total_cmp(&b.1))
         .map(|best| best.0);
 
-    for (index, item) in items.iter().enumerate() {
-        if let Some(item) = item {
-            info!(
-                "{}\n\t{}\t{}\t{}",
-                item.drop_name,
-                item.platinum,
-                item.ducats as f32 / 10.0,
-                if Some(index) == best { "<----" } else { "" }
-            );
-        } else {
-            warn!("Unknown item\n\tUnknown");
-        }
-    }
+    items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            if let Some(item) = item {
+                let is_best = Some(index) == best;
+                info!(
+                    "{}\n\t{}p\t{}d\t{}",
+                    item.drop_name,
+                    item.platinum,
+                    item.ducats as f32 / 10.0,
+                    if is_best { "<----" } else { "" }
+                );
+                Some(DetectedItem {
+                    drop_name: item.drop_name.clone(),
+                    platinum: item.platinum,
+                    ducats_ratio: item.ducats as f32 / 10.0,
+                    is_best,
+                })
+            } else {
+                warn!("Unknown item\n\tUnknown");
+                None
+            }
+        })
+        .collect()
 }
+
+// ── Watchers ──────────────────────────────────────────────────────────────────
 
 fn log_watcher(path: PathBuf, event_sender: mpsc::Sender<()>) {
     debug!("Path: {}", path.display());
@@ -94,10 +118,11 @@ fn log_watcher(path: PathBuf, event_sender: mpsc::Sender<()>) {
                                 continue;
                             }
                         };
-                        // debug!("> {:?}", line);
                         if line.contains("Pause countdown done")
                             || line.contains("Got rewards")
-                            || line.contains("Created /Lotus/Interface/ProjectionRewardChoice.swf")
+                            || line.contains(
+                                "Created /Lotus/Interface/ProjectionRewardChoice.swf",
+                            )
                         {
                             reward_screen_detected = true;
                         }
@@ -105,7 +130,9 @@ fn log_watcher(path: PathBuf, event_sender: mpsc::Sender<()>) {
 
                     if reward_screen_detected {
                         info!("Detected, waiting...");
-                        sleep(Duration::from_millis(1500));
+                        // 750ms wait so the Warframe reward screen finishes its slide-in animation
+                        // before we take the picture. (Lowered from 1500ms to increase response time)
+                        sleep(Duration::from_millis(750));
                         event_sender.send(()).unwrap();
                     }
 
@@ -136,20 +163,7 @@ fn hotkey_watcher(hotkey: HotKey, event_sender: mpsc::Sender<()>) {
     });
 }
 
-#[allow(dead_code)]
-fn benchmark() -> Result<(), Box<dyn Error>> {
-    for _ in 0..10 {
-        let image = image::open("input3.png").unwrap();
-        println!("Converted");
-        let text = reward_image_to_reward_names(image, None);
-        println!("got names");
-        let text = text.iter().map(|s| normalize_string(s));
-        println!("{:#?}", text);
-    }
-    // clean up tesseract
-    drop(OCR.lock().unwrap().take());
-    Ok(())
-}
+// ── CLI ───────────────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
@@ -165,11 +179,16 @@ struct Arguments {
     window_name: String,
 }
 
+// ── Main ──────────────────────────────────────────────────────────────────────
+
 fn main() -> Result<(), Box<dyn Error>> {
     let arguments = Arguments::parse();
-    let default_log_path = PathBuf::from_str(&std::env::var("HOME").unwrap()).unwrap().join(PathBuf::from_str(".local/share/Steam/steamapps/compatdata/230410/pfx/drive_c/users/steamuser/AppData/Local/Warframe/EE.log")?);
+    let default_log_path = PathBuf::from_str(&std::env::var("HOME").unwrap())
+        .unwrap()
+        .join(PathBuf::from_str(".local/share/Steam/steamapps/compatdata/230410/pfx/drive_c/users/steamuser/AppData/Local/Warframe/EE.log")?);
     let log_path = arguments.game_log_file_path.unwrap_or(default_log_path);
     let window_name = arguments.window_name;
+
     let env = Env::default()
         .filter_or("WFINFO_LOG", "info")
         .write_style_or("WFINFO_STYLE", "always");
@@ -180,15 +199,27 @@ fn main() -> Result<(), Box<dyn Error>> {
         .format_target(false)
         .init();
 
-    let windows = Window::all()?;
-    let Some(warframe_window) = windows.iter().find(|x| x.title() == window_name) else {
-        return Err("Warframe window not found".into());
-    };
+    // Find and take ownership of the Warframe window so it can be moved to
+    // the detection thread. We specifically pick the largest one to avoid grabbing
+    // the tiny Warframe Launcher window if it's still running in the background.
+    let mut windows = Window::all()?;
+    let warframe_idx = windows
+        .iter()
+        .enumerate()
+        .filter(|(_, x)| x.title() == window_name)
+        .max_by_key(|(_, x)| x.width() * x.height())
+        .map(|(idx, _)| idx)
+        .ok_or("Warframe window not found")?;
+    let warframe_window = windows.swap_remove(warframe_idx);
 
-    debug!(
-        "Capture source resolution: {:?}x{:?}",
-        warframe_window.width(),
-        warframe_window.height()
+    let win_x = warframe_window.x() as f32;
+    let win_y = warframe_window.y() as f32;
+    let win_w = warframe_window.width() as f32;
+    let win_h = warframe_window.height() as f32;
+
+    println!(
+        "Found Warframe window: {}x{} at {},{}",
+        win_w, win_h, win_x, win_y
     );
 
     let (prices, items) = fetch_prices_and_items()?;
@@ -196,19 +227,53 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     info!("Loaded database");
 
-    let (event_sender, event_receiver) = channel();
+    // Channels: game events -> detection thread -> overlay UI
+    let (event_sender, event_receiver) = channel::<()>();
+    let (result_sender, result_receiver) = channel::<DetectionResult>();
 
     log_watcher(log_path, event_sender.clone());
     hotkey_watcher("F12".parse()?, event_sender);
 
-    while let Ok(()) = event_receiver.recv() {
-        info!("Capturing");
-        run_detection(warframe_window, &db);
-    }
+    // Background thread: wait for events and run OCR detection
+    thread::spawn(move || {
+        while let Ok(()) = event_receiver.recv() {
+            info!("Capturing");
+            let result = run_detection(&warframe_window, &db);
+            if result_sender.send(result).is_err() {
+                break;
+            }
+        }
+        drop(OCR.lock().unwrap().take());
+    });
 
-    drop(OCR.lock().unwrap().take());
+    // Overlay height (accommodates up to 4 reward cards)
+    let overlay_h = 180.0_f32;
+    // Position at the bottom of the captured window area
+    let overlay_y = win_y + win_h - overlay_h;
+
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title("WFInfo Overlay")
+            .with_always_on_top()
+            .with_transparent(true)
+            .with_decorations(false)
+            .with_resizable(false)
+            .with_inner_size([win_w, overlay_h])
+            .with_position([win_x, overlay_y]),
+        ..Default::default()
+    };
+
+    // Run the egui event loop on the main thread (required on some platforms)
+    eframe::run_native(
+        "WFInfo Overlay",
+        options,
+        Box::new(|_cc| Ok(Box::new(OverlayApp::new(result_receiver)))),
+    )?;
+
     Ok(())
 }
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod test {
