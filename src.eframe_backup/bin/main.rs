@@ -1,15 +1,17 @@
 // Overlay moved to library
 
 use std::thread::sleep;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use std::{error::Error, str::FromStr};
 use std::{fs::File, thread};
 use std::{
-    io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
-    path::PathBuf, sync::mpsc
+    io::{BufRead, BufReader, Read, Seek, SeekFrom},
+    sync::mpsc::channel,
 };
+use std::{path::PathBuf, sync::mpsc};
 
 use clap::Parser;
+use eframe::egui;
 use env_logger::{Builder, Env};
 use global_hotkey::{hotkey::HotKey, GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use image::DynamicImage;
@@ -23,13 +25,7 @@ use wfinfo::{
     utils::fetch_prices_and_items,
 };
 
-pub struct DetectedItem {
-    pub drop_name: String,
-    pub platinum: f32,
-    pub ducats_ratio: f32,
-    pub is_best: bool,
-}
-pub type DetectionResult = Vec<Option<DetectedItem>>;
+use wfinfo::overlay::{DetectedItem, DetectionResult, OverlayApp};
 
 // ── Detection ─────────────────────────────────────────────────────────────────
 
@@ -113,7 +109,7 @@ fn log_watcher(path: PathBuf, event_sender: mpsc::Sender<()>) {
 
                     let mut reward_screen_detected = false;
 
-                    let reader = BufReader::new(std::io::Read::by_ref(&mut f));
+                    let reader = BufReader::new(f.by_ref());
                     for line in reader.lines() {
                         let line = match line {
                             Ok(line) => line,
@@ -229,57 +225,50 @@ fn main() -> Result<(), Box<dyn Error>> {
     let (prices, items) = fetch_prices_and_items()?;
     let db = Database::load_from_file(Some(&prices), Some(&items));
 
-    info!("Loaded database. Running in MangoHud Headless mode.");
-    println!("MangoHud text pipe successfully configured at /tmp/wfinfo_rewards.txt");
+    info!("Loaded database");
 
-    // Channels: game events -> main loop
-    let (event_sender, event_receiver) = mpsc::channel::<()>();
+    // Channels: game events -> detection thread -> overlay UI
+    let (event_sender, event_receiver) = channel::<()>();
+    let (result_sender, result_receiver) = channel::<DetectionResult>();
 
     log_watcher(log_path, event_sender.clone());
     hotkey_watcher("F12".parse()?, event_sender);
 
-    // Initial clear of the MangoHud file to prevent stale items on boot
-    let _ = File::create("/tmp/wfinfo_rewards.txt").map(|mut f| f.write_all(b""));
-    let mut clear_time: Option<Instant> = None;
-
-    loop {
-        match event_receiver.recv_timeout(Duration::from_secs(1)) {
-            Ok(()) => {
-                info!("Capturing Screen...");
-                let result = run_detection(&warframe_window, &db);
-                
-                // Format the results specifically for MangoHud execution
-                let mut out = String::new();
-                for item_opt in result {
-                    if let Some(item) = item_opt {
-                        out.push_str(&format!("{} ({}p, {}d)\n", item.drop_name, item.platinum, item.ducats_ratio));
-                    }
-                }
-                
-                if !out.is_empty() {
-                    if let Ok(mut file) = File::create("/tmp/wfinfo_rewards.txt") {
-                        let _ = file.write_all(out.as_bytes());
-                        println!("Saved exactly to MangoHud display: /tmp/wfinfo_rewards.txt!");
-                    }
-                    // Start the active auto-dismiss timer!
-                    clear_time = Some(Instant::now() + Duration::from_secs(30));
-                }
+    // Background thread: wait for events and run OCR detection
+    thread::spawn(move || {
+        while let Ok(()) = event_receiver.recv() {
+            info!("Capturing");
+            let result = run_detection(&warframe_window, &db);
+            if result_sender.send(result).is_err() {
+                break;
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                // Background cycle: verify if 30 seconds have passed yet
-                if let Some(time) = clear_time {
-                    if Instant::now() >= time {
-                        if let Ok(mut file) = File::create("/tmp/wfinfo_rewards.txt") {
-                            let _ = file.write_all(b"");
-                            println!("30 Second Timeout Reached. Successfully erased MangoHud text.");
-                        }
-                        clear_time = None;
-                    }
-                }
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
-    }
+        drop(OCR.lock().unwrap().take());
+    });
+
+    // Overlay height (accommodates up to 4 reward cards)
+    let overlay_h = 180.0_f32;
+    // Position at the bottom of the captured window area
+    let overlay_y = win_y + win_h - overlay_h;
+
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title("WFInfo Overlay")
+            .with_always_on_top()
+            .with_transparent(true)
+            .with_decorations(false)
+            .with_resizable(false)
+            .with_inner_size([win_w, overlay_h])
+            .with_position([win_x, overlay_y]),
+        ..Default::default()
+    };
+
+    // Run the egui event loop on the main thread (required on some platforms)
+    eframe::run_native(
+        "WFInfo Overlay",
+        options,
+        Box::new(|_cc| Ok(Box::new(OverlayApp::new(result_receiver)))),
+    )?;
 
     Ok(())
 }
